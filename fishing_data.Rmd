@@ -1,0 +1,331 @@
+---
+title: "Fishing_Data"
+author: "Owen Liu"
+date: "April 28, 2016"
+output: html_document
+---
+
+San Nicolas Island, and the mainland, have been fished for red urchin for a long time.  I want to look for evidence of sea otter effects at SNI .  The relevant fishing blocks are 813 (SNI East Side) and 814 (SNI West Side).  Interestingly, anecdotally, the sea otters that were translocated and established a population on SNI only occupy the west side of the island.  Hence, the hypothesis is that we should be able to see a difference in effects on urchins (otters' preferred prey) from one side of the island to the other.
+
+Otter populations have looked like this at SNI:
+```{r otter population, echo=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rEDM)
+library(reshape2)
+
+WD <- getwd()
+ott <- read.csv(file=paste(WD,"/data/Table2_independent_sea_otters.csv",sep=""))
+ott$Date<-as.Date(ott$Date,format="%m/%d/%Y")
+plot(ott$Date,ott$West, main="Independent Sea Otters Observed at SNI",xlab="Year",ylab="Number of Otters",type="l",col="darkgreen",
+     ylim=c(0,50),lwd=2)
+lines(ott$Date,rowSums(cbind(ott$North,ott$South)),col="red",lwd=2)
+legend("topleft",col=c("darkgreen","red"),legend=c("West","North and South"),lty=1)
+```
+
+We can look at the fishing data as well.  For now, I am using data from an old NCEAS project by Carrie Kappel.
+
+```{r fisheries data import, echo=FALSE}
+
+common.names <- list()
+datall <- list()
+for(i in 1969:2006) {
+  file <- paste0(i,"_dat.csv") #file name
+  datname <- paste0("dat",i) # name for R variable
+  inp <- read.csv(file=paste0(WD,"/data/",file)) # import the .csv
+  
+  if(class(inp$Block)=="factor") inp$Block <- as.integer(as.character(inp$Block)) # Fix broken variable type in some of the data
+  inp <- inp[!is.na(inp$Block),] # remove rows with no block number
+  
+  assign(datname,inp) # store data in a dataframe in R
+  
+  common.names[[i-1968]] <- names(inp)
+  datall[[datname]] <- inp
+}
+
+
+##names
+commonnames = matrix(NA,nrow=41,ncol=38)
+commonnames[(1:length(common.names[[i]])),i]=common.names[[i]]
+for(i in 1:length(common.names)) {
+  names <- common.names[[i]]
+  rows <- length(names)
+  commonnames[(1:rows),i]=names
+}
+
+uniq.names <- as.character(unique(melt(commonnames)$value))
+# making a key in Excel
+write.csv(uniq.names,file=paste0(WD,"/data/fishing_name_key.csv"))
+names.key <- read.csv(paste0(WD,"/data/fishing_name_key.csv"),stringsAsFactors = F)[,-1]
+names.key <- names.key %>% rename(Original=x,New=X.1)
+```
+
+Now we have the names, we can put all of the data together into one longform dataframe
+
+```{r long form catch data}
+# Putting all the data into one long form dataframe
+catch.all <- data_frame(year=NA,Block=NA,species=NA,catch=NA)
+yr <- 1969
+for(i in 1:length(datall)) {
+  
+  dat <- datall[[i]]
+  
+  # match to key and rename columns
+  datnames <- data_frame(Original=names(dat)) %>% left_join(names.key) %>% select(New)
+  names(dat) <- datnames$New
+  
+  out <- melt(dat,id.vars="Block",variable.name="species",value.name="catch") %>% mutate(year=yr)
+  catch.all <- bind_rows(catch.all,out)
+  yr <- yr+1
+}
+catch.all <- catch.all[-1,]
+
+# Normalized first differences
+catch.norm <- catch.all %>% 
+  arrange(species,Block,year) %>% 
+  group_by(Block) %>% 
+  mutate(lead1=lead(catch),diff=lead1-catch,norm=(diff-mean(diff,na.rm=T))/sd(diff,na.rm=T)) %>%
+  select(-catch,-lead1,-diff) %>%
+  rename(catch=norm) %>%
+  ungroup()
+
+```
+
+Now we can aggregate by years and blocks for each species and see how complete our data is
+
+```{r aggregate by years}
+# this is the number of non-NA years by both block and species
+species.block.count <- catch.norm %>% group_by(species,Block) %>%
+  filter(!is.na(catch)) %>%
+  summarise(num.yrs=n()) %>%
+  arrange(desc(num.yrs)) %>%
+  group_by(species)
+
+# We also want to look at, for a given year and block, how many species we have data for
+years.block.count <- catch.norm %>% group_by(year,Block) %>%
+  filter(!is.na(catch)) %>%
+  summarise(num.spp=n()) %>%
+  arrange(desc(num.spp)) %>%
+  group_by(year)
+
+# How many species have a decent number of timeseries with >=20 annual values?
+usable.species.data <- species.block.count %>% 
+  filter(num.yrs>=20) %>% 
+  group_by(species) %>% 
+  summarise(ts=n(),records=sum(num.yrs)) %>%
+  arrange(desc(records))
+
+# from these data, there's 11 species with >100 actual records.  We'll use these as our test cases.
+
+```
+
+### Lobster trial run
+Let's see if we can cobble together a simplex and s-map analysis for lobster, stiching together multiple timeseries.
+What we're going to do is stich together the timeseries from all of the separate fishing blocks with >= 20 years of annual data,
+then run simplex and s-map
+
+```{r lobster analysis}
+# all blocks with >= 20 years' data
+lobster.blocks <- filter(species.block.count,species=="lobster",num.yrs>=20)
+lobster.dat <- filter(catch.norm, species=="lobster",Block %in% lobster.blocks$Block) %>% arrange(Block,year)
+
+# we need a record of the segments (indices of the beginning and end of each timeseries), so that simplex and s-map do not produce library or prediction vectors that span separate timeseries. This 2-column matrix denotes the row indices of the first and last record in each timeseries
+segments <- lobster.dat %>% mutate(ind = row_number()) %>% group_by(Block) %>% summarise(first=first(ind),last=last(ind))
+
+# Now we can produce a random set of half of the segments for prediction, and use the others for the library
+rndlib <- segments %>% sample_frac(0.5,replace=F) %>% arrange(first) %>% select(-Block)
+rndpred <- anti_join(segments,rndlib) %>% arrange(first) %>% select(-Block) # prediction vectors and library vectors mutually exclusive
+
+# Now we can finally run simplex and s-map
+lobster.simplex <- simplex(as.matrix(select(lobster.dat,year,catch)),lib=as.matrix(rndlib),pred=as.matrix(rndpred),E=c(2:8))
+plot(lobster.simplex$E,lobster.simplex$rho,type="l",xlab="Embedding Dimension (E)",ylab="Forecast Skill(rho)",main="Spiny Lobster")
+
+# Good forecast skill, and best E (best embedding dimension) is 3!  Now we can s-map to look for nonlinearity
+lobster.smap <- s_map(as.matrix(select(lobster.dat,year,catch)),lib=as.matrix(rndlib),pred=as.matrix(rndpred),E=3)
+plot(lobster.smap$theta,lobster.smap$rho,type="l",xlab="Nonlinearity (theta)",ylab="Forecast Skill(rho)",main="Spiny Lobster")
+
+```
+
+This seemed to work! The landings data are relatively low-dimensional (best E=3), and s-map suggests nonlinearity (forecast skill improves as theta is tuned up, followed by a dropoff after)
+
+Let's do other species.  We'll create a function that calculates and plots simplex and smap output for a species, just like for lobster above.
+
+```{r generalized simplex/smap function for this data set}
+spp.simp.smap <- function(spp, plotout = TRUE) {
+  
+  # all blocks with >= 20 years' data
+  dat.blocks <- filter(species.block.count,species==spp,num.yrs>=20)
+  spp.dat <- filter(catch.norm, species==spp,Block %in% dat.blocks$Block) %>% arrange(Block,year)
+  
+  # we need a record of the segments (indices of the beginning and end of each timeseries), so that simplex and s-map do not produce library or prediction vectors that span separate timeseries. This 2-column matrix denotes the row indices of the first and last record in each timeseries
+  segments <- spp.dat %>% mutate(ind = row_number()) %>% group_by(Block) %>% summarise(first=first(ind),last=last(ind))
+  
+  # Now we can produce a random set of half of the segments for prediction, and use the others for the library
+  rndlib <- segments %>% sample_frac(0.5,replace=F) %>% arrange(first) %>% select(-Block)
+  rndpred <- anti_join(segments,rndlib) %>% arrange(first) %>% select(-Block) # prediction vectors and library vectors mutually exclusive
+  rndlib <- as.matrix(rndlib)
+  rndpred <- as.matrix(rndpred)
+  
+  # composite timeseries (just year and data)
+  ts.mat <- as.matrix(select(spp.dat,year,catch))
+  
+  # Now we can finally run simplex and s-map.
+  # A NOTE HERE: using option exclusion_radius allows us to also remove from the library for each prediction the concurrent years' data from the other pooled timeseries, reducing overestimation due to spatial autocorrelation. For now we'll use an exclusion radius of 1 (for simplex) and min(3,E) for smap.
+  spp.simplex <- simplex(ts.mat,lib=rndlib,pred=rndpred,E=c(2:10),exclusion_radius = 1)
+  if(plotout) {
+    plot(spp.simplex$E,spp.simplex$rho,type="l",xlab="Embedding Dimension (E)",ylab="Forecast Skill(rho)",main=spp)
+  }
+  
+  # find best E from simplex output
+  bestE <- spp.simplex$E[which(spp.simplex$rho==max(spp.simplex$rho))]
+  print(paste("Best embedding dimension is",bestE))
+  
+  # Good forecast skill, and best E (best embedding dimension) recorded.  Now we can s-map to look for nonlinearity
+  spp.smap <- s_map(ts.mat,lib=rndlib,pred=rndpred,E=bestE,exclusion_radius = min(3,bestE))
+  if(plotout) {
+    plot(spp.smap$theta,spp.smap$rho,type="l",xlab="Nonlinearity (theta)",ylab="Forecast Skill(rho)",main=spp)
+  }
+  out <- list(simp = spp.simplex,smap = spp.smap)
+  return(out)
+}
+
+# for all species with >100 records
+spps <- usable.species.data$species[1:10]
+spp.simp.list <- list()
+spp.smap.list <- list()
+
+for(i in 1:length(spps)) {
+  sppname <- spps[i]
+  temp <- spp.simp.smap(spps[i],plotout=FALSE)
+  spp.simp.list[[sppname]] <- temp$simp
+  spp.smap.list[[sppname]] <- temp$smap
+  rm(temp)
+}
+
+# plot simplex output
+opar <- par()
+par(mfrow=c(2,2))
+
+for(i in 1:length(spp.simp.list)) {
+  sppname <- names(spp.simp.list)[i]
+  df <- spp.simp.list[[i]]
+  plot(df$E,df$rho,type="l",xlab="Embedding Dimension (E)",ylab="Forecast Skill(rho)",main=paste(sppname,"simplex"))
+}
+
+# plot smap output
+plot.new()
+
+for(i in 1:length(spp.smap.list)) {
+  sppname <- names(spp.smap.list)[i]
+  df <- spp.smap.list[[i]]
+  plot(df$theta,df$rho,type="l",xlab="Nonlinearity (theta)",ylab="Forecast Skill(rho)",main=paste(sppname,"smap"))
+}
+par(opar)
+
+```
+
+
+
+
+
+
+
+
+
+
+Urchin data from Sarah Teck
+```{r teck data import}
+for(i in seq(1978,2010,by=2)) {
+  file <- paste0(i,"_landings.csv") #file name
+  datname <- paste0("land",i) # name for R variable
+  inp <- read.csv(file=paste0(WD,"/data/teck urchin data/",file)) # import the .csv
+  
+  # fix a few variable names
+  names(inp)[1] <- "serial"
+  names(inp)[11:12] <- c("land.month","land.day")
+  
+  assign(datname,inp) # store data in a dataframe in R
+}
+
+# 2011 data is a slightly different format (different variable names)
+land2011 <- read.csv(file=paste0(WD,"/data/teck urchin data/2011_landings.csv"))
+land2011 <- land2011[,-c(7,10,12:14,16)] # remove unmatched columns
+names(land2011) <- names(land1978) # change variable names to match other data
+
+# Join all the data into a master
+landings.all <- bind_rows(land1978,land1980,land1982,land1984,land1986,land1988,land1990,land1992,land1994,land1996,land1998,
+                          land2000,land2002,land2004,land2006,land2008,land2010,land2011)
+head(landings.all)
+```
+
+Group total landings by year, month, and origin of catch
+
+```{r grouping urchin data}
+# Landings, converted to metric tons, by origin block, year, and month
+land.by.month <- landings.all %>% group_by(origin.code,landing.year,land.month) %>%
+  summarise(catch.mt = sum(reported.catch.lbs)/2204.62)
+
+# Number of months' data for each fishing block
+blocks.months.count <- land.by.month %>% group_by(origin.code) %>% 
+  summarise(num.months=n()) %>% 
+  arrange(desc(num.months))
+
+# Landings, converted to metric tons, by origin block and year
+land.by.year <- landings.all %>% group_by(origin.code,landing.year) %>%
+  summarise(catch.mt = sum(reported.catch.lbs)/2204.62)
+# Number of years' data for each fishing block
+blocks.years.count <- land.by.year %>% group_by(origin.code) %>% 
+  summarise(num.yrs=n()) %>% 
+  arrange(desc(num.yrs))
+
+# just block 813
+land.813 <- subset(land.by.year,land.by.year$origin.code==813)
+land.814 <- subset(land.by.year,land.by.year$origin.code==814)
+
+# and a quick look at the data
+cols <- c("813, No Otters"="blue","814, Otters"="red")
+ggplot() +geom_line(data=land.813,aes(x=landing.year,y=catch.mt,col="813, No Otters"))+
+  geom_line(data=land.814,aes(x=landing.year,y=catch.mt,col="814, Otters"))+
+  xlab("Year")+
+  ylab("Catch (MT)") +
+  ggtitle("Urchin Catch Over Time, Blocks 813 and 814") +
+  scale_color_manual(name="Fishing Block",values=cols)
+
+plot.block <- function(block) {
+  block.dat<-subset(land.by.year,land.by.year$origin.code==block)
+  ggplot() +geom_line(data=block.dat,aes(x=landing.year,y=catch.mt))+
+  xlab("Year")+
+  ylab("Catch (MT)") +
+  ggtitle("Urchin Catch Over Time")
+}
+
+```
+
+Sample simplex projection
+
+```{r simplex projection}
+# Start simple (1 time series)
+# We'll pick an urchin block with the longest time series (block 653)
+# Looks like this:
+bl653 <- land.by.year %>% filter(origin.code==653)
+plot(bl653$landing.year,bl653$catch.mt,type="l",main="Urchin Landings, Block 653", xlab="Year",ylab="Landings (mt)")
+
+# First difference and standardize
+bl653.st <- bl653 %>% mutate(land.diff=catch.mt-lag(catch.mt),land.st=as.numeric(scale(land.diff)))
+plot(bl653.st$landing.year,bl653.st$land.st,type="l",main="Urchin Landings, Block 653", 
+     xlab="Year",ylab="Standardized Landings (mt)")
+
+# Simplex (from rEDM package)
+test <- simplex(bl653.st$land.st)
+plot(test$E,test$rho,type="l")
+
+# over time horizon
+test2 <- simplex(bl653.st$land.st,E=2,tp=1:10)
+plot(test2$tp,test2$rho,type="l")
+
+#smaptest
+smaptest <- s_map(bl653.st$land.st,E=2)
+plot(smaptest$theta,smaptest$rho,type="l")
+
+```

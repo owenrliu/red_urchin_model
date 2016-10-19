@@ -1,0 +1,260 @@
+---
+title: "Red Urchin Nonlinear Forecast Model"
+author: "Owen Liu"
+date: "October 18, 2016"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo=F}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(ggplot2)
+library(rEDM)
+WD <- getwd()
+
+library(knitr)
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+Urchin data from Sarah Teck
+```{r teck data import}
+for(i in seq(1978,2010,by=2)) {
+  file <- paste0(i,"_landings.csv") #file name
+  datname <- paste0("land",i) # name for R variable
+  inp <- read.csv(file=paste0(WD,"/data/teck urchin data/",file)) # import the .csv
+  
+  # fix a few variable names
+  names(inp)[1] <- "serial"
+  names(inp)[11:12] <- c("land.month","land.day")
+  
+  assign(datname,inp) # store data in a dataframe in R
+}
+
+# 2011 data is a slightly different format (different variable names)
+land2011 <- read.csv(file=paste0(WD,"/data/teck urchin data/2011_landings.csv"))
+land2011 <- land2011[,-c(7,10,12:14,16)] # remove unmatched columns
+names(land2011) <- names(land1978) # change variable names to match other data
+
+# Join all the data into a master
+landings.all <- bind_rows(land1978,land1980,land1982,land1984,land1986,land1988,land1990,land1992,land1994,land1996,land1998,
+                          land2000,land2002,land2004,land2006,land2008,land2010,land2011)
+head(landings.all)
+```
+
+Group total landings by year, month, and origin of catch
+
+```{r grouping urchin data}
+# Landings, converted to metric tons, by origin block, year, and month
+land.by.month <- landings.all %>% group_by(origin.code,landing.year,land.month) %>%
+  summarise(catch.mt = sum(reported.catch.lbs)/2204.62)
+
+# Landings, converted to metric tons, by origin block and year
+land.by.year <- landings.all %>% group_by(origin.code,landing.year) %>%
+  summarise(catch.mt = sum(reported.catch.lbs)/2204.62)
+
+# just block 813 and 14
+land.SNI <- land.by.month %>% filter(origin.code %in% c(813,814))
+```
+
+## Forecast Model for Red Urchin, using Physical and Biological Data
+
+#### The San Nicolas Island Dataset
+
+San Nicolas Island is a small, remote island situated about 100 kilometers offshore from southern California. The benthic monitoring data herein have been collected more or less every six months for more than 30 years by the USGS and its Western Ecological Research Center (USGS-WERC), and in 2013 the datasets were made available publicly through Ecological Archives:
+
+Michael C. Kenner, James A. Estes, M. Tim Tinker, James L. Bodkin, Robert K. Cowen, Christopher Harrold, Brian B. Hatfield, Mark Novak, Andrew Rassweiler, and Daniel C. Reed. 2013. A multi-decade time series of kelp forest community structure at San Nicolas Island, California (USA). Ecology 94:2654. http://dx.doi.org/10.1890/13-0561.1
+
+The datasets together represent a remarkable record of rocky reef dynamics, across varying environmental conditions such as major storm events and shifts in large oceanographic cycles like the El Nino Southern Oscillation and the Pacific Decadal Oscillation. From the abstract:
+
+> San Nicolas Island is surrounded by broad areas of shallow subtidal habitat, characterized by dynamic kelp forest communities that undergo dramatic and abrupt shifts in community composition. Although these reefs are fished, the physical isolation of the island means that they receive less impact from human activities than most reefs in Southern California, making San Nicolas an ideal place to evaluate alternative theories about the dynamics of these communities. Here we present monitoring data from seven sampling stations surrounding the island, including data on fish, invertebrate, and algal abundance. These data are unusual among subtidal monitoring data sets in that they combine relatively frequent sampling (twice per year) with an exceptionally long time series (since 1980). Other outstanding qualities of the data set are the high taxonomic resolution captured and the monitoring of permanent quadrats and swaths where the history of the community structure at specific locations has been recorded through time. Finally, the data span a period that includes two of the strongest ENSO events on record, a major shift in the Pacific decadal oscillation, and the reintroduction of sea otters to the island in 1987 after at least 150 years of absence. These events provide opportunities to evaluate the effects of bottom-up forcing, top-down control, and physical disturbance on shallow rocky reef communities.
+
+The island itself is small, about 14 kilometer long and 5 km wide. The seven sampling stations are situated around the island, some in pairs:
+
+![Map of the San Nicolas Island monitoring stations. From Kenner et al. (2013).](SNI_site_map.jpg)
+
+```{r monitoring stations,message=F,echo=F}
+W_D <- getwd()
+monitoring_stations <- read.csv(paste0(W_D,"/data/Table1_Monitoring_Stations.csv"))
+names(monitoring_stations) <- c("Station Number","Station Name","Latitude","Longitude","Mean Depth (m)","Date First Sampled")
+
+kable(monitoring_stations,align=c("c","l","c","c","c","l"),caption="SNI Monitoring Stations.")
+```
+
+Data is collected at each station during each monitoring period on the density and percent cover of benthic species (algae and invertebrates), and benthic and midwater fish species. Each of the seven monitoring sites has a number of permanent swaths along which data is collected every period:
+
+![Example layout of a SNI monitoring site, showing individual 10m swaths on either side of the 50m main transect line. From Kenner et al. (2013).](example_swaths.jpg)
+
+For full description of the monitoring methods, see the metadata from Kenner et al. (2013) at the DOI above. For our analyses, we use a subset of data, compiled from the benthic density raw data. Data for the 12 species of interest (above) were compiled, and to maximize the potential amount of dynamic information, the data from each swath at each station was treated as a separate time series, leaving us with 37 time series for each of the 12 species. Each time series contains 63 data points, corresponding to the 63 monitoring periods, one approximately every six months from Fall, 1980 to Fall, 2011. Individual time series of species density were normalized to have a mean of zero and a standard deviation of 1.
+
+These first lines of code import the benthic data we need.
+  
+```{r survey data, message=F}
+# The raw data has been processed into a set of normalized time series elsewhere.
+dat.long <- read.csv(paste0(WD,"/data/benth_data_trim_normalized2016-09-09.csv"))
+
+# our particular species of interest
+study_spp <- c("pat","red","purp","wavy","paras","pis","cys","lam","eis","pter","mac","ymac")
+```
+
+We also import a species name key, mostly for reference and plot labeling later.
+
+```{r species key}
+# Species Key for all benthic density species (for reference)
+#*************************************
+spp.key <- read.csv(file=paste(W_D,'/data/Table4_Species_sampled.csv',sep=''),stringsAsFactors = F) # All species, all surveys
+spp.key.bdens <- spp.key %>% 
+  filter(DataSet=="Benthic density") %>%
+  select(-SpeciesCode) %>%
+  rename(dataset=DataSet, long=SpeciesName)
+
+# better names
+spp.key.bdens$short <- c("pat","red","purp","wavy","astro","derm","halc","halr","limp","paras","pis","pyc","cys","lam","ymac","youn","eis","pter","mac")
+# ************************************
+
+# quick function to turn a "genus species" identifier into an abbreviated gen.spe identifier
+abbr.species.names <- function(x) {
+    temp <- strsplit(x," ")[[1]]
+    g <- substr(temp[1],1,3)
+    spe <- substr(temp[2],1,3)
+    paste(g,spe,sep=".")
+}
+
+# Names to apply to plots later
+spp.key.bdens$plotting <- sapply(spp.key.bdens$long,abbr.species.names)
+
+# identify kelp juveniles as a separate variable
+spp.key.bdens$plotting[spp.key.bdens$long=="Macrocystis pyrifera <1m"] <- "Mac.pyr(j)"
+```
+
+Next we produce a block (wide-form) dataset, where each column represents a species' time series.
+
+```{r block data}
+# Cast to wide form
+#*************************************
+benthdat.block <- dat.long %>%
+  select(-dens) %>%
+  spread(key=spp,value=norm) %>%
+  arrange(site)
+#*************************************
+```
+
+To keep things simple, for now we are only concerned with the West End sites. This is where a sea otter reintroduction was done, and so we are interested in the dynamics there.
+
+```{r cut to west end}
+benthdat.block <- benthdat.block %>%
+  filter(site %in% c("2_10L", "2_22L", "2_32R", "2_39L", "2_45L", "3_10R", "3_22R", "3_32L", "3_39R", "3_45L"))
+```
+
+### Adding Physical Variables
+
+Along with investigating dynamic species interactions, we also want to explore where physical forcing fits into our dynamic story. A body of other research has established that a combination of physical forcing (waves, storms), temperature, and lower frequency climate modes (e.g., El Ninos) have an important influence on the dynamics of kelp forests (Reed et al., 2011; Cavanaugh et al., 2011; Bell et al., 2015; Young et al., 2015). With these data, we can draw connections between the physical variables and not just *Macrocystis pyrifera* dynamics, but all of the species in our constrained trophic web.
+
+We have four datasets, already processed into the same time frame (periods) as the SNI benthic monitoring data (with separate code not included here):
+
+* **The Multivariate ENSO index (MEI)**
+    + The first principal component of a composite set of physical parameters
+    + Positive values of the MEI index are generally associated with El Nino conditions, decreases in wind-driven upwelling, warmer surface waters and nutrient-poor conditions
+    + From NOAA, http://www.esrl.noaa.gov/psd/enso/mei
+    + Variable here is the average index value for the four months preceding each Spring or Fall monitoring period (i.e., December to March or June to September, respectively)
+* **The Pacific Decadal Oscillation index (PDO)**
+    + Leading empirical orthogonal function (EOF) of monthly sea surface temperature anomalies (SST-A) over the North Pacific (poleward of 20° N) after the global average sea surface temperature has been removed
+    + Positive PDO values indicate warmer SST, and nutrient-poor conditions along the western coast of the contiguous United States
+    + Obtained from http://research.jisao.washington.edu/pdo/
+    + Aggregated and averaged the same way as MEI
+* **The North Pacific Gyre Oscillation (NPGO)**
+    + From Di Lorenzo, 2008, http://www.o3d.org/npgo/
+    + Climate pattern that emerges as the 2nd dominant mode of sea surface height variability (2nd EOF SSH) in the Northeast Pacific
+    + Better correlated with salinity, nutrients, and chlorophyll than PDO, showing forcing for the planktonic community
+    + Strong predictor of upwelling cells south of 38 deg N
+    + Aggregated and averaged the same way as MEI and PDO
+* **Sea surface temperature (SST)**
+    + Sea surface temperature data from Begg Rock and San Nicolas Island buoys, from the [Coastal Data Information Program (CDIP)](cdip.ucsd.edu)
+    + Incomplete data (only have data since 1996)
+    + Similar to the above, value is an average SST for the four months preceding each period
+* **Maximum significant wave height (Hs)**
+    + Also from the Begg and SNI buoys and the CDIP
+    + Signficant wave height is defined as the average height, in meters, of the one third highest waves in the record
+    + Instead of an average, value here is the maximum significant wave height of the four months preceding each period. This is meant to capture any large storm events, as well as general level of physical disturbance
+  
+As with the other variables in our analysis, these physical variables have been normalized to zero mean and unit standard deviation to facilitate comparison among variables and not distort state-space reconstructions. Unlike the biological data, where there are unique spatial replicates, the physical data have only one value for each of the 63 monitoring periods, and hence their values are replicated (copied) for each site to match the total length of the biological data.
+
+```{r physical variable import}
+# Read in the physical variables
+phys.dat <- read.csv(paste0(WD,"/data/phys_vars_combined.csv"))
+phys.dat.norm <- read.csv(paste0(WD,"/data/phys_vars_combined_norm.csv"))
+
+# Combine with benthic biological block data, by period
+multiblock <- benthdat.block %>% left_join(phys.dat.norm,by="period")
+
+phys.vars <- c("mei.mean","pdo.mean","npgo.mean","waves.max","sst.mean")
+
+# Add them to the an overall name key
+phys.vars.key <- data_frame(long=c("Multivariate ENSO Index","Pacific Decadal Oscillation","North Pacific Gyre Oscillation","Significant Wave Height","Sea Surface Temperature"),dataset="Physical",short=phys.vars, plotting=c("(P) MEI","(P) PDO","(P) NPGO","(P) Max Hs","(P) SST"))
+
+fullkey <- bind_rows(spp.key.bdens,phys.vars.key)
+fullkey <- bind_rows(fullkey, data_frame(long="NA",dataset="NA",short="const",plotting="Constant"))
+```
+
+***
+
+### Combine with Landings Data
+
+We have to line up the periods in the survey data with our landings data. Survey periods are approximately every 6 months, so we'll bin the landings data in order to line values up.
+
+```{r landings data}
+# This is a key matching actually years/months to survey periods from the Kenner et al. data
+period.key <- data_frame(year=rep(1980:2011,each=12),month=rep(1:12,32),period=c(rep(NA,5),rep(1,5),rep(2:63,each=6),rep(64,2)))
+
+# match landings data to period key and remove irrelevant data
+
+land.SNI.per <- land.SNI %>% 
+  left_join(period.key,by=c("landing.year"="year","land.month"="month"))
+write.csv(land.SNI.per,file=paste0(WD,"/data/red_urchin_landings_SNI_by_month.csv"))
+
+# for each period, sum the landings to make just one value for each period
+periods <- data_frame(period=c(1:63,1:63),origin.code=c(rep(813,63),rep(814,63)))
+
+land.SNI.sum <- periods %>%
+  left_join(land.SNI.per,by=c("period","origin.code")) %>%
+  group_by(origin.code,period) %>%
+  summarise(land.tot=sum(catch.mt)) %>%
+  
+# Cast to wide form
+  spread(origin.code,land.tot)
+names(land.SNI.sum) <- c("period","east","west")
+
+write.csv(land.SNI.sum,file=paste0(WD,"/data/red_urchin_landings_SNI_by_period.csv"))
+```
+
+We also have to normalize the landings data, to line up with the other variables in the analysis
+
+```{r norm landings}
+# We can also normalize the variables to match dimensionally with our biological data
+normalise <- function(vec) (vec-mean(vec,na.rm=T))/sd(vec,na.rm=T)
+
+land.dat.norm <- land.SNI.sum %>% mutate_each(funs(normalise),-period)
+
+write.csv(land.dat.norm,file=paste0(WD,"/data/red_urchin_landings_SNI_normalised.csv"))
+```
+
+Finally, combine with other block data
+
+```{r join landings}
+# Combine with benthic biological block data, by period
+multiblock <- multiblock %>% left_join(land.dat.norm,by="period")
+
+land.vars <- c("east","west")
+
+# Add them to the an overall name key
+land.vars.key <- data_frame(long=c("Landings, East","Landings, West"),dataset="Landings",short=land.vars, plotting=c("East","West"))
+
+fullkey <- bind_rows(fullkey,land.vars.key)
+```
+
+## Establish Embedding Dimension, Theta, and Cross-Mapping
+
+```{r simplex}
+
+```
+
